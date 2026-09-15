@@ -12,6 +12,8 @@ Email address: xaviergbradford@gmail.com, eric.yoon4@gmail.com, avahxiao@gmail.c
 
 from typing import Optional, Dict, List, Tuple, Set
 import heapq
+import math
+import time
 
 from ar_hackathon.models.graph_state import GraphState
 from ar_hackathon.models.drive_unit import DriveUnit
@@ -21,6 +23,11 @@ PENALTY = 1_000_000.0
 
 BATCH_EXTRA = 0.35      # max relative detour tolerated to batch-grab a pod
 BATCH_ABS = 2.0         # max absolute detour tolerated to batch-grab a pod
+
+SIM_HORIZON = 16        # how many steps each candidate move is rolled forward
+MAX_CANDIDATES = 8      # cap on moves compared per call
+CALL_BUDGET = 0.25      # wall-clock seconds allowed per call before giving up
+TERM_W = 1.0            # weight on the terminal heuristic for undone pods
 
 # ---- Persistent per-graph caches (rebuilt when the floor layout changes) ----
 _graph_key = None
@@ -223,12 +230,11 @@ def _batch_pickup_target(state: GraphState, unit: DriveUnit,
     return best
 
 
-def _plan_target(state: GraphState, drive_unit_id: int) -> Optional[int]:
+def _plan_all_targets(state: GraphState) -> Dict[int, Optional[int]]:
     """
     Assign every drive unit a destination (a station to deliver to, a pod's
-    storage node to fetch from, or a standby location), then return the one
-    for our unit. The assignment is recomputed each call from the supplied
-    snapshot so it stays consistent across all units.
+    storage node to fetch from, or a standby location). Re-computed from the
+    supplied snapshot each call so it stays consistent across all units.
     """
     units = sorted(state.drive_units, key=lambda u: u.id)
     targets: Dict[int, Optional[int]] = {}
@@ -288,7 +294,205 @@ def _plan_target(state: GraphState, drive_unit_id: int) -> Optional[int]:
                 targets[u.id] = t
                 claimed.add(t)
 
-    return targets.get(drive_unit_id)
+    return targets
+
+
+def _plan_target(state: GraphState, drive_unit_id: int) -> Optional[int]:
+    """Destination for a single drive unit (see _plan_all_targets)."""
+    return _plan_all_targets(state).get(drive_unit_id)
+
+
+def _start_move(state: GraphState, unit: DriveUnit, next_node: int) -> None:
+    """Port of engine._move_drive_unit."""
+    edge = state.get_edge(unit.current_node, next_node)
+    unit.in_transit = True
+    unit.transit_destination = next_node
+    unit.transit_remaining_time = edge.weight
+
+
+def _advance_units(state: GraphState) -> None:
+    """Port of engine._advance_drive_units."""
+    for unit in state.drive_units:
+        if unit.in_transit:
+            unit.transit_remaining_time -= 1
+            if unit.transit_remaining_time <= 0:
+                unit.current_node = unit.transit_destination
+                unit.in_transit = False
+                unit.transit_destination = None
+                unit.transit_remaining_time = 0
+
+
+def _resolve_dp(state: GraphState) -> None:
+    """Port of engine._process_deliveries_and_pickups."""
+    for unit in sorted(state.drive_units, key=lambda u: u.id):
+        if unit.in_transit:
+            continue
+        for pod_id in list(unit.carrying):
+            pod = state.get_pod(pod_id)
+            if pod is not None and pod.destination_station == unit.current_node:
+                unit.carrying.remove(pod_id)
+                pod.carried_by = None
+                pod.current_node = unit.current_node
+                pod.delivery_time = state.current_time_step
+                if pod in state.active_pods:
+                    state.active_pods.remove(pod)
+                state.delivered_pods.append(pod)
+        if unit.has_capacity:
+            waiting = [pod for pod in state.active_pods
+                       if pod.carried_by is None and pod.current_node == unit.current_node]
+            waiting.sort(key=lambda p: (p.entry_time, p.id))
+            for pod in waiting:
+                if not unit.has_capacity:
+                    break
+                pod.carried_by = unit.id
+                pod.current_node = None
+                unit.carrying.append(pod.id)
+
+
+def _hop_to(state: GraphState, unit: DriveUnit, target: Optional[int]) -> Optional[int]:
+    """First hop of the congestion-aware path toward target, or None."""
+    if target is None or target == unit.current_node:
+        return None
+    path = _path_to(state, unit.current_node, target)
+    return path[1] if len(path) >= 2 else None
+
+
+def _sim_step(state: GraphState, spawn_map=None, threshold: Optional[int] = None) -> None:
+    """
+    Advance a simulated state by one full referee step.
+
+    spawn_map: optional {entry_time: [Pod,...]} used only by offline validation
+               harnesses (the live API never knows the pod schedule).
+    threshold: if set, only idle units with id >= threshold are routed this
+               step (lower ids were already polled by the referee).
+    """
+    if spawn_map:
+        for pod in spawn_map.get(state.current_time_step, ()):
+            state.active_pods.append(pod.deep_copy())
+
+    _resolve_dp(state)
+
+    targets = _plan_all_targets(state)
+    for unit in sorted(state.drive_units, key=lambda u: u.id):
+        if unit.in_transit:
+            continue
+        if threshold is not None and unit.id < threshold:
+            continue
+        hop = _hop_to(state, unit, targets.get(unit.id))
+        if hop is not None and _can_enter(state, unit, hop):
+            _start_move(state, unit, hop)
+
+    _advance_units(state)
+    _resolve_dp(state)
+    state.current_time_step += 1
+
+
+def _sim_rollout(state: GraphState, unit_id: int, spawn_map, horizon: int) -> float:
+    """
+    Finish the current step (routing only units with id >= unit_id, since the
+    referee already committed the lower ids) and then roll `horizon` more
+    steps. Returns the score of the resulting world.
+    """
+    _sim_step(state, spawn_map, threshold=unit_id)
+    for _ in range(horizon - 1):
+        _sim_step(state, spawn_map)
+    return _score_state(state)
+
+
+def _effective_horizon(state: GraphState) -> int:
+    """
+    Planning ahead helps most when the map is sparse; under heavy traffic the
+    upstream decisions dominate, so a shorter lookahead is both cheaper and
+    less myopic about congestion others will cause.
+    """
+    if len(state.drive_units) >= 4:
+        return 12
+    return SIM_HORIZON
+
+
+def _score_state(state: GraphState) -> float:
+    """Reward for a simulated world: delivered pods score their decay, and
+    still-active pods get an optimistic terminal estimate, so the controller
+    is nudged to finish carried work and keep short remaining legs."""
+    total = 0.0
+    t = state.current_time_step
+    for pod in state.delivered_pods:
+        total += math.exp(-(pod.delivery_time - pod.entry_time) / 50.0)
+    for pod in state.active_pods:
+        if pod.carried_by is not None:
+            carrier = state.get_drive_unit(pod.carried_by)
+            if carrier is not None:
+                q = _static_distance(state, carrier.current_node, pod.destination_station)
+            else:
+                q = 0.0
+        elif pod.current_node is not None:
+            q = _static_distance(state, pod.current_node, pod.destination_station)
+        else:
+            q = 0.0
+        total += TERM_W * math.exp(-(t + q - pod.entry_time) / 50.0)
+    return total
+
+
+def _greedy_move(drive_unit_id: int, state: GraphState) -> Optional[int]:
+    """The non-lookahead baseline: follow the global greedy assignment."""
+    unit = state.get_drive_unit(drive_unit_id)
+    if unit is None or unit.in_transit:
+        return None
+    hop = _hop_to(state, unit, _plan_target(state, drive_unit_id))
+    if hop is not None and _can_enter(state, unit, hop):
+        return hop
+    return None
+
+
+def _choose_move(drive_unit_id: int, state: GraphState, t0: float) -> Optional[int]:
+    """
+    One-ply model-predictive control. Enumerate the enterable moves plus
+    'wait', roll each forward under the greedy baseline policy, and pick the
+    move with the best simulated score. Ties fall back to the greedy move.
+    """
+    unit = state.get_drive_unit(drive_unit_id)
+    if unit is None or unit.in_transit:
+        return None
+
+    greedy = _greedy_move(drive_unit_id, state)
+
+    candidates: List[Optional[int]] = []
+    seen = set()
+    if greedy is not None:
+        candidates.append(greedy)
+        seen.add(greedy)
+
+    others = []
+    for nb in state.neighbors(unit.current_node):
+        if nb in seen:
+            continue
+        edge = state.get_edge(unit.current_node, nb)
+        if edge is not None and _can_enter(state, unit, nb):
+            others.append((edge.weight, nb))
+    others.sort(key=lambda x: (x[0], x[1]))
+    for _, nb in others:
+        if len(candidates) >= MAX_CANDIDATES:
+            break
+        candidates.append(nb)
+        seen.add(nb)
+
+    candidates.append(None)  # always offer "wait"
+
+    best_move = greedy
+    best_score = -INF
+    horizon = _effective_horizon(state)
+    for move in candidates:
+        if time.monotonic() - t0 > CALL_BUDGET:
+            break
+        sim = state.deep_copy()
+        sim_unit = sim.get_drive_unit(drive_unit_id)
+        if move is not None:
+            _start_move(sim, sim_unit, move)
+        score = _sim_rollout(sim, drive_unit_id, None, horizon)
+        if score > best_score + 1e-9:
+            best_score = score
+            best_move = move
+    return best_move
 
 
 def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]:
@@ -306,16 +510,8 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
     unit = state.get_drive_unit(drive_unit_id)
     if unit is None or unit.in_transit:
         return None
-
-    target = _plan_target(state, drive_unit_id)
-    if target is None or target == unit.current_node:
-        return None
-
-    path = _path_to(state, unit.current_node, target)
-    if len(path) < 2:
-        return None
-
-    nxt = path[1]
-    if _can_enter(state, unit, nxt):
-        return nxt
-    return None
+    t0 = time.monotonic()
+    try:
+        return _choose_move(drive_unit_id, state, t0)
+    except Exception:
+        return _greedy_move(drive_unit_id, state)
