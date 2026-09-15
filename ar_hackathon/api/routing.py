@@ -11,12 +11,14 @@ Email address: xaviergbradford@gmail.com, eric.yoon4@gmail.com, avahxiao@gmail.c
 """
 
 import heapq
+import itertools
 import math
 from typing import Dict, List, Optional, Set, Tuple
 
 from ar_hackathon.models.graph_state import GraphState
 
 OCCUPANCY_PENALTY = 3.0
+PLAN_BIAS = 0.4
 SCORE_SCALE = 50.0
 INF = float("inf")
 
@@ -25,6 +27,7 @@ _SEEN_SIG: Optional[tuple] = None
 _RECOMPUTE_STEP: Optional[int] = None
 
 _TOPOLOGY_FP: Optional[Tuple[tuple, tuple]] = None
+_LAST_STEP: Optional[int] = None
 _IDX: Dict[int, int] = {}
 _ADJ: Dict[int, List[tuple]] = {}
 _FW: List[List[float]] = []
@@ -32,6 +35,7 @@ _STORAGE: Set[int] = set()
 
 _PLANS: Dict[int, List[int]] = {}
 _GOALS: Dict[int, object] = {}
+_BATCH: Dict[int, List[str]] = {}
 
 
 def _fingerprint(state: GraphState) -> Tuple[tuple, tuple]:
@@ -41,12 +45,20 @@ def _fingerprint(state: GraphState) -> Tuple[tuple, tuple]:
 
 
 def _ensure_topology(state: GraphState) -> None:
-    global _TOPOLOGY_FP, _IDX, _ADJ, _FW, _STORAGE, _ASSIGN, _PLANS, _GOALS
+    global _TOPOLOGY_FP, _LAST_STEP, _IDX, _ADJ, _FW, _STORAGE, _ASSIGN, _PLANS, _GOALS, _BATCH
+    now = state.current_time_step
+    if _LAST_STEP is not None and now < _LAST_STEP:
+        _PLANS.clear()
+        _GOALS.clear()
+        _BATCH.clear()
+        _ASSIGN = None
+    _LAST_STEP = now
     fp = _fingerprint(state)
     if fp == _TOPOLOGY_FP:
         return
     _PLANS.clear()
     _GOALS.clear()
+    _BATCH.clear()
     _ASSIGN = None
     node_list = sorted(state.nodes, key=lambda n: n.id)
     idx = {n.id: i for i, n in enumerate(node_list)}
@@ -81,7 +93,20 @@ def _ensure_topology(state: GraphState) -> None:
     _STORAGE = {n.id for n in node_list if n.node_type == "storage"}
 
 
-def _dijkstra(state: GraphState, start: int, goal: int) -> Optional[List[int]]:
+def _plan_used_edges(uid: int) -> set:
+    used = set()
+    for u, pl in _PLANS.items():
+        if u == uid or len(pl) < 2:
+            continue
+        for i in range(len(pl) - 1):
+            a, b = pl[i], pl[i + 1]
+            if a > b:
+                a, b = b, a
+            used.add((a, b))
+    return used
+
+
+def _dijkstra(state: GraphState, start: int, goal: int, uid: Optional[int] = None) -> Optional[List[int]]:
     if start == goal:
         return [start]
     occ = {}
@@ -91,6 +116,7 @@ def _dijkstra(state: GraphState, start: int, goal: int) -> Optional[List[int]]:
         else:
             key = (e.from_node, e.to_node)
         occ[key] = state.edge_occupancy(e.from_node, e.to_node)
+    used = _plan_used_edges(uid) if uid is not None else set()
     adj = _ADJ
     pq = [(0.0, start)]
     dist = {start: 0.0}
@@ -105,6 +131,8 @@ def _dijkstra(state: GraphState, start: int, goal: int) -> Optional[List[int]]:
             key = (min(u, v), max(u, v)) if bidir else (u, v)
             cnt = occ.get(key, 0)
             cost = w if cap is None else w * (1.0 + OCCUPANCY_PENALTY * cnt)
+            if key in used:
+                cost += PLAN_BIAS
             nd = d + cost
             if nd < dist.get(v, INF):
                 dist[v] = nd
@@ -191,16 +219,163 @@ def _hungarian_maximize(values: List[List[float]], nr: int, nc: int) -> List[int
     return res
 
 
-def _pod_reward(state: GraphState, unit_node: int, pod) -> float:
-    if unit_node not in _IDX or pod.current_node not in _IDX or pod.destination_station not in _IDX:
+def _dist(a: int, b: int) -> float:
+    if a in _IDX and b in _IDX:
+        return _FW[_IDX[a]][_IDX[b]]
+    return INF
+
+
+def _build_legs(state: GraphState, batch_ids: List[str], carried_ids: List[str]) -> List[tuple]:
+    items: List[tuple] = []
+    seen = set()
+    for pid in carried_ids:
+        p = state.get_pod(pid)
+        if p is None:
+            continue
+        seen.add(pid)
+        items.append(("delivery", p.destination_station, pid))
+    for pid in batch_ids:
+        if pid in seen:
+            continue
+        p = state.get_pod(pid)
+        if p is None:
+            continue
+        if pid in carried_ids:
+            items.append(("delivery", p.destination_station, pid))
+        elif p.carried_by is None and p.current_node is not None:
+            items.append(("pickup", p.current_node, pid))
+            items.append(("delivery", p.destination_station, pid))
+        else:
+            continue
+        seen.add(pid)
+    return items
+
+
+def _order_legs(state: GraphState, current: int, items: List[tuple], now: int):
+    n = len(items)
+    if n == 0:
+        return [], {}, 0.0
+
+    def feasible(order):
+        pickup_pos = {}
+        for i, (kind, node, pid) in enumerate(order):
+            if kind == "pickup":
+                pickup_pos[pid] = i
+        for i, (kind, node, pid) in enumerate(order):
+            if kind == "delivery" and pid in pickup_pos and i < pickup_pos[pid]:
+                return False
+        return True
+
+    def cost(order):
+        prev = current
+        t = 0.0
+        for (kind, node, pid) in order:
+            t += _dist(prev, node)
+            prev = node
+        return t
+
+    def tie_key(order):
+        total = 0
+        pos = 0
+        for (kind, node, pid) in order:
+            p = state.get_pod(pid)
+            if kind == "delivery" and p is not None:
+                total += pos * max(0, now - p.entry_time)
+            pos += 1
+        return total
+
+    best_order = None
+    best_cost = INF
+    best_tie = None
+    if n <= 6:
+        for perm in itertools.permutations(range(n)):
+            order = [items[i] for i in perm]
+            if not feasible(order):
+                continue
+            c = cost(order)
+            tk = tie_key(order)
+            if best_order is None or c < best_cost - 1e-9 or (abs(c - best_cost) <= 1e-9 and tk < best_tie):
+                best_order = order
+                best_cost = c
+                best_tie = tk
+    else:
+        remaining = list(items)
+        picked = set()
+        prev = current
+        while remaining:
+            best_i = None
+            best_d = INF
+            for i, (kind, node, pid) in enumerate(remaining):
+                if kind == "delivery" and pid not in picked and any(
+                    k == "pickup" and q == pid for (k, q, _) in remaining
+                ):
+                    continue
+                nd = _dist(prev, node)
+                if nd < best_d:
+                    best_d = nd
+                    best_i = i
+            leg = remaining.pop(best_i)
+            if leg[0] == "pickup":
+                picked.add(leg[2])
+            best_order = (best_order or []) + [leg]
+            prev = leg[1]
+        best_cost = cost(best_order)
+        best_tie = tie_key(best_order)
+        best_order = list(best_order)
+
+    times: Dict[str, float] = {}
+    prev = current
+    acc = 0.0
+    for (kind, node, pid) in best_order:
+        acc += _dist(prev, node)
+        prev = node
+        if kind == "delivery":
+            times[pid] = acc
+    return best_order, times, best_cost
+
+
+def _tour_value(state: GraphState, unit_node: int, batch_ids: List[str], now: int) -> float:
+    current = unit_node
+    items = _build_legs(state, batch_ids, [])
+    if not items:
         return 0.0
-    d1 = _FW[_IDX[unit_node]][_IDX[pod.current_node]]
-    d2 = _FW[_IDX[pod.current_node]][_IDX[pod.destination_station]]
-    if d1 >= INF or d2 >= INF:
-        return 0.0
-    age = state.current_time_step - pod.entry_time
-    total = age + d1 + d2
-    return 100.0 * math.exp(-total / SCORE_SCALE)
+    _, times, _ = _order_legs(state, current, items, now)
+    total = 0.0
+    for pid, travel in times.items():
+        p = state.get_pod(pid)
+        if p is None:
+            continue
+        age = max(0, now - p.entry_time)
+        total += 100.0 * math.exp(-(age + travel) / SCORE_SCALE)
+    return total
+
+
+def _marginal_gain(state: GraphState, unit, batch_ids: List[str], cand_id: str, now: int) -> float:
+    base = _tour_value(state, unit.current_node, batch_ids, now)
+    extended = _tour_value(state, unit.current_node, batch_ids + [cand_id], now)
+    return extended - base
+
+
+def _first_obligation(state: GraphState, unit) -> Optional[int]:
+    carried = list(unit.carrying)
+    batch = [pid for pid in (_BATCH.get(unit.id) or [])]
+    items = _build_legs(state, batch, carried)
+    if not items:
+        return None
+    order, _, _ = _order_legs(state, unit.current_node, items, state.current_time_step)
+    for (kind, node, pid) in order:
+        p = state.get_pod(pid)
+        if p is None:
+            continue
+        if kind == "pickup":
+            if p.carried_by == unit.id:
+                continue
+            if p.carried_by is None and p.current_node is not None:
+                return node
+            continue
+        if pid in unit.carrying:
+            return node
+    return None
 
 
 def _signature(state: GraphState) -> tuple:
@@ -208,32 +383,77 @@ def _signature(state: GraphState) -> tuple:
 
 
 def _recompute(state: GraphState) -> None:
-    global _ASSIGN, _SEEN_SIG, _RECOMPUTE_STEP
+    global _ASSIGN, _SEEN_SIG, _RECOMPUTE_STEP, _BATCH
     units = sorted(
         (u for u in state.drive_units if not u.in_transit and not u.carrying and u.has_capacity),
         key=lambda u: u.id,
     )
     pods = [p for p in state.active_pods if p.carried_by is None and p.current_node is not None]
+    now = state.current_time_step
     new_assign: Dict[int, Optional[str]] = {u.id: None for u in state.drive_units}
+    _BATCH = {u.id: [] for u in state.drive_units}
     if units and pods:
-        rewards: List[List[float]] = []
-        for u in units:
-            row = [_pod_reward(state, u.current_node, p) for p in pods]
-            rewards.append(row)
+        rewards = [[_tour_value(state, u.current_node, [p.id], now) for p in pods] for u in units]
         matched = _hungarian_maximize(rewards, len(units), len(pods))
+        claimed = set()
         for i, pod_idx in enumerate(matched):
             if pod_idx >= 0:
-                new_assign[units[i].id] = pods[pod_idx].id
+                pid = pods[pod_idx].id
+                claimed.add(pid)
+                _BATCH[units[i].id].append(pid)
+                new_assign[units[i].id] = pid
+        unclaimed = [p for p in pods if p.id not in claimed]
+        improved = True
+        while improved:
+            improved = False
+            for u in units:
+                if len(_BATCH[u.id]) >= u.capacity:
+                    continue
+                best_pod = None
+                best_gain = 0.0
+                for p in unclaimed:
+                    gain = _marginal_gain(state, u, _BATCH[u.id], p.id, now)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_pod = p
+                if best_pod is not None:
+                    _BATCH[u.id].append(best_pod.id)
+                    unclaimed.remove(best_pod)
+                    improved = True
+
+        def _batch_value(u, batch):
+            return _tour_value(state, u.current_node, list(batch), now)
+
+        improved = True
+        while improved:
+            improved = False
+            for u_off in units:
+                if not _BATCH[u_off.id]:
+                    continue
+                for p in list(_BATCH[u_off.id]):
+                    for u_on in units:
+                        if u_on.id == u_off.id or len(_BATCH[u_on.id]) >= u_on.capacity:
+                            continue
+                        off_left = [q for q in _BATCH[u_off.id] if q != p]
+                        on_next = _BATCH[u_on.id] + [p]
+                        cur = _batch_value(u_off, _BATCH[u_off.id]) + _batch_value(u_on, _BATCH[u_on.id])
+                        new = _batch_value(u_off, off_left) + _batch_value(u_on, on_next)
+                        if new > cur + 1e-9:
+                            _BATCH[u_off.id] = off_left
+                            _BATCH[u_on.id] = on_next
+                            improved = True
+    for u in units:
+        if _BATCH.get(u.id):
+            new_assign[u.id] = _BATCH[u.id][0]
     _ASSIGN = new_assign
     _SEEN_SIG = _signature(state)
-    _RECOMPUTE_STEP = state.current_time_step
+    _RECOMPUTE_STEP = now
 
 
 def _unit_wants_work(state: GraphState, u) -> bool:
     if u.carrying or not u.has_capacity:
         return False
-    pid = _ASSIGN.get(u.id) if _ASSIGN else None
-    if pid:
+    for pid in (_BATCH.get(u.id) or []):
         p = state.get_pod(pid)
         if p is not None and p.carried_by is None and p.current_node is not None:
             return False
@@ -251,29 +471,6 @@ def _ensure_assignments(state: GraphState) -> None:
         _recompute(state)
 
 
-def _compute_goal(state: GraphState, unit) -> Optional[int]:
-    if unit.carrying:
-        pods = [state.get_pod(pid) for pid in unit.carrying]
-        pods = [p for p in pods if p is not None]
-        if not pods:
-            return None
-        oldest = min(pods, key=lambda p: (p.entry_time, p.id))
-        if oldest.destination_station == unit.current_node:
-            return None
-        return oldest.destination_station
-    if not unit.has_capacity:
-        return None
-    pid = _ASSIGN.get(unit.id)
-    if pid is None:
-        return None
-    p = state.get_pod(pid)
-    if p is None or p.carried_by is not None or p.current_node is None:
-        return None
-    if p.current_node == unit.current_node:
-        return None
-    return p.current_node
-
-
 def _reposition(state: GraphState, unit) -> None:
     cur = unit.current_node
     if cur not in _IDX:
@@ -289,13 +486,55 @@ def _reposition(state: GraphState, unit) -> None:
             best = s
     if best is None or best == cur:
         return
-    plan = _dijkstra(state, cur, best)
+    plan = _dijkstra(state, cur, best, unit.id)
     if plan:
         _PLANS[unit.id] = plan
         _GOALS[unit.id] = ("repos", best)
 
 
-def _commit(state: GraphState, unit) -> Optional[int]:
+def _hop_valid(state: GraphState, unit, nxt: int) -> bool:
+    edge = state.get_edge(unit.current_node, nxt)
+    if edge is None:
+        return False
+    if edge.capacity is not None and state.edge_occupancy(unit.current_node, nxt) >= edge.capacity:
+        return False
+    node = state.get_node(nxt)
+    if node is not None and node.capacity is not None and state.node_occupancy(nxt) >= node.capacity:
+        return False
+    return True
+
+
+def _path_static_cost(path: List[int]) -> float:
+    total = 0.0
+    for i in range(len(path) - 1):
+        total += _dist(path[i], path[i + 1])
+    return total
+
+
+def _block_wait(state: GraphState, unit, nxt: int) -> float:
+    edge = state.get_edge(unit.current_node, nxt)
+    if edge is not None and edge.capacity is not None and state.edge_occupancy(unit.current_node, nxt) >= edge.capacity:
+        waits = [
+            u.transit_remaining_time
+            for u in state.drive_units
+            if u.in_transit and edge.connects(u.current_node, u.transit_destination)
+        ]
+        return max(0.0, min(waits)) if waits else float(edge.weight)
+    node = state.get_node(nxt)
+    if node is not None and node.capacity is not None and state.node_occupancy(nxt) >= node.capacity:
+        standing = [u for u in state.drive_units if not u.in_transit and u.current_node == nxt]
+        if standing:
+            return 1.0
+        transit = [
+            u.transit_remaining_time
+            for u in state.drive_units
+            if u.in_transit and u.transit_destination == nxt
+        ]
+        return max(0.0, min(transit)) if transit else 1.0
+    return 0.0
+
+
+def _try_hop(state: GraphState, unit) -> Optional[int]:
     plan = _PLANS.get(unit.id)
     if not plan or len(plan) < 2:
         return None
@@ -305,15 +544,7 @@ def _commit(state: GraphState, unit) -> Optional[int]:
         _GOALS[unit.id] = None
         return None
     nxt = plan[1]
-    edge = state.get_edge(cur, nxt)
-    if edge is None:
-        _PLANS[unit.id] = []
-        _GOALS[unit.id] = None
-        return None
-    if edge.capacity is not None and state.edge_occupancy(cur, nxt) >= edge.capacity:
-        return None
-    node = state.get_node(nxt)
-    if node is not None and node.capacity is not None and state.node_occupancy(nxt) >= node.capacity:
+    if not _hop_valid(state, unit, nxt):
         return None
     _PLANS[unit.id] = plan[1:]
     return nxt
@@ -326,10 +557,10 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
             return None
         _ensure_topology(state)
         _ensure_assignments(state)
-        goal = _compute_goal(state, unit)
+        goal = _first_obligation(state, unit)
         if goal is not None:
             if _GOALS.get(drive_unit_id) != goal or not _PLANS.get(drive_unit_id):
-                plan = _dijkstra(state, unit.current_node, goal)
+                plan = _dijkstra(state, unit.current_node, goal, drive_unit_id)
                 if plan and plan[-1] == goal:
                     _PLANS[drive_unit_id] = plan
                     _GOALS[drive_unit_id] = goal
@@ -341,8 +572,25 @@ def drive_unit_next_move(drive_unit_id: int, state: GraphState) -> Optional[int]
                 _PLANS[drive_unit_id] = []
                 _GOALS[drive_unit_id] = None
             plan = _PLANS.get(drive_unit_id, [])
-            if not plan:
+            if not unit.carrying and unit.has_capacity and not plan:
                 _reposition(state, unit)
-        return _commit(state, unit)
+        hop = _try_hop(state, unit)
+        if hop is None and goal is not None:
+            plan = _PLANS.get(drive_unit_id, [])
+            if len(plan) >= 2 and plan[0] == unit.current_node:
+                wait = _block_wait(state, unit, plan[1])
+                stay_cost = _path_static_cost(plan)
+                replan = _dijkstra(state, unit.current_node, goal, drive_unit_id)
+                if (
+                    replan
+                    and replan[-1] == goal
+                    and len(replan) >= 2
+                    and _hop_valid(state, unit, replan[1])
+                    and _path_static_cost(replan) + 1e-9 < stay_cost + wait
+                ):
+                    _PLANS[drive_unit_id] = replan
+                    _GOALS[drive_unit_id] = goal
+                    hop = _try_hop(state, unit)
+        return hop
     except Exception:
         return None
